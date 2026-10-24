@@ -1,11 +1,14 @@
 # fancy-live
 
 First-party Pusher HTTP publishing and protected-channel authorization for PHP.
-The core requires PHP 8.3+ and no framework or third-party runtime dependency.
+The core requires PHP 8.4+ and no framework or third-party runtime dependency.
 An optional Laravel 13 broadcaster uses the same publisher and signer.
 
-Source checkpoint: not published yet. After publication, install with
-`composer require particle-academy/fancy-live`.
+```bash
+composer require particle-academy/fancy-live
+```
+
+## Publish an event
 
 ```php
 use FancyLive\Config;
@@ -73,23 +76,97 @@ requires a resolved user and a successful host policy; presence requires an
 array of host-approved metadata. The authenticated user's broadcasting ID is
 used. No JSONP callback is accepted.
 
+For example, register a per-user policy in the host's service provider after
+configuring the connection:
+
+```php
+use Illuminate\Support\Facades\Broadcast;
+
+Broadcast::connection('fancy-live')->channel('user.{id}',
+    static fn ($user, string $id): bool => (string) $user->getAuthIdentifier() === $id,
+);
+```
+
+Put the endpoint in the host's `routes/web.php`, which already applies the web
+session and request-forgery middleware. Choose the application's authentication
+guard and rate limit; do not exempt this route from those protections:
+
+```php
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Broadcast;
+use Illuminate\Support\Facades\Route;
+
+Route::post('/broadcasting/auth', static function (Request $request) {
+    return response()->json(Broadcast::connection('fancy-live')->auth($request));
+})->middleware(['auth', 'throttle:60,1']);
+```
+
+The client sends `socket_id` and `channel_name` (for example `private-user.7`).
+The broadcaster checks the resolved user and matching host policy before signing.
+For a presence channel, return an approved metadata array from its policy instead
+of `true`; the broadcaster obtains the identity from the authenticated user.
+If the host already registers Laravel's broadcasting auth route, use that route
+and its configured middleware instead of registering a duplicate endpoint.
+
 Laravel `Channel`, `PrivateChannel`, `PresenceChannel`, custom event names and
 sender exclusion use the same core publishing path. A broadcast is limited to
 100 channels; it does not silently split a publish into partial batches. Events
 should be dispatched after the database transaction commits.
 
-The browser side is `createSocketEcho` from
-`@particle-academy/fancy-query/socket`, supplied to `FancyDataRoot`. It holds only
-the public app key and uses the host's authorization endpoint for protected
-subscriptions.
+## Pair with fancy-query/socket
+
+The browser transport ships in `@particle-academy/fancy-query` 0.9.0 and later.
+It holds only the public app key. The HTTP API endpoint and app secret remain
+on the server; the WebSocket URL uses the managed service's browser endpoint.
+
+```bash
+npm install @particle-academy/fancy-query@^0.9.0
+```
+
+```tsx
+import { FancyDataRoot } from "@particle-academy/fancy-query";
+import { createSocketEcho } from "@particle-academy/fancy-query/socket";
+
+function liveClient(csrfToken: string) {
+  return createSocketEcho({
+    url: "wss://socket.example/app/PUBLIC_APP_KEY",
+    authorize: async ({ socketId, channelName }, signal) => {
+      const response = await fetch("/broadcasting/auth", {
+        method: "POST", credentials: "same-origin", signal,
+        headers: { "Content-Type": "application/json", Accept: "application/json", "X-CSRF-TOKEN": csrfToken },
+        body: JSON.stringify({ socket_id: socketId, channel_name: channelName }),
+      });
+      if (!response.ok) throw new Error("Channel authorization refused.");
+      return response.json();
+    },
+  });
+}
+
+// Create one client per browser app using the host-provided CSRF token.
+// <FancyDataRoot echo={echo}>{children}</FancyDataRoot>
+```
+
+For a literal event name such as `cms.updated`, listen with a leading dot
+(`.cms.updated`) or disable the client's Laravel event namespace. Use Fancy query
+to invalidate/refetch authoritative state when an event arrives and after every
+subscription acknowledgement, including reconnection. The transport has no
+client publishing or encrypted-channel support. The host owns the WebSocket
+service, credentials, channel policy and reconnect reconciliation.
 
 ## Tests and protocol references
 
-Tests use the existing approved PHPUnit/Laravel toolchain without installing a
-new dependency. Set `FANCY_LIVE_TEST_AUTOLOAD` to that toolchain's Composer
-autoload file, then run `composer test`. A standalone development dependency
-declaration and CI bootstrap await maintainer approval. `php tests/core-smoke.php`
-also exercises the core in a fresh process with no Composer or framework loader.
+```bash
+composer install
+composer validate --strict
+composer test
+composer run test:core
+```
+
+Development uses the owner-approved Pest 5 framework and Laravel 13 for the
+optional integration tests. These are development dependencies only; consumers
+of the core still require only PHP. `composer test` runs `vendor/bin/pest` with
+this repository's Composer autoloader. `composer run test:core` starts a fresh
+PHP process with no Composer or framework loader, also a separate CI step.
 
 The unit tests inspect exact transport arguments without opening a server.
 Laravel integration tests use the real framework broadcaster and driver

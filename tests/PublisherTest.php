@@ -9,137 +9,122 @@ use FancyLive\LiveFailure;
 use FancyLive\Publisher;
 use FancyLive\SignedRequest;
 use FancyLive\Transport;
-use PHPUnit\Framework\Attributes\DataProvider;
-use PHPUnit\Framework\TestCase;
 
 /** Public Pusher documentation vectors, not real credentials. No network calls. */
-final class PublisherTest extends TestCase
+function livePublisherConfig(): Config
 {
-    private function config(): Config
-    {
-        return new Config('https://socket.example', '3', '278d425bdf160c739803', '7ad3773142a6692b25b8');
-    }
-
-    private function transport(int $status = 200): Transport
-    {
-        return new class($status) implements Transport
-        {
-            public array $requests = [];
-
-            public function __construct(private int $status) {}
-
-            public function send(SignedRequest $request): HttpResponse
-            {
-                $this->requests[] = $request;
-
-                return new HttpResponse($this->status);
-            }
-        };
-    }
-
-    public function test_http_signature_matches_the_official_pusher_vector(): void
-    {
-        $transport = $this->transport();
-        $publisher = new Publisher($this->config(), $transport, static fn (): int => 1353088179);
-        $publisher->publish(['project-3'], 'foo', ['some' => 'data']);
-        $request = $transport->requests[0];
-        $this->assertSame('{"name":"foo","channels":["project-3"],"data":"{\\"some\\":\\"data\\"}"}', $request->body);
-        parse_str(parse_url($request->url, PHP_URL_QUERY), $query);
-        $this->assertSame('ec365a775a4cd0599faeb73354201b6f', $query['body_md5']);
-        $this->assertSame('da454824c97ba181a32ccc17a72625ba02771f50b50e1e7430e47a1f3f457e6c', $query['auth_signature']);
-        $this->assertSame('1353088179', $query['auth_timestamp']);
-    }
-
-    public function test_private_authorization_matches_the_official_vector(): void
-    {
-        $auth = new Authorization($this->config());
-        $this->assertSame(['auth' => '278d425bdf160c739803:58df8b0c36d6982b82c3ecf6b4662e34fe8c25bba48f5369f135bf843651c3a4'],
-            $auth->privateChannel('1234.1234', 'private-foobar'));
-    }
-
-    public function test_presence_authorization_signs_the_exact_returned_data(): void
-    {
-        $auth = new Authorization($this->config());
-        $result = $auth->presenceChannel('1234.1234', 'presence-foobar', 10, ['name' => 'Mr. Channels']);
-        $this->assertSame('{"user_id":10,"user_info":{"name":"Mr. Channels"}}', $result['channel_data']);
-        // Independently checked with Python hmac/hashlib. The documentation's
-        // displayed presence digest does not reproduce for its stated bytes.
-        $this->assertSame('278d425bdf160c739803:31935e7d86dba64c2a90aed31fdc61869f9b22ba9d8863bba239c03ca481bc80', $result['auth']);
-    }
-
-    public function test_publishing_preserves_json_objects_and_excludes_the_sender(): void
-    {
-        $transport = $this->transport();
-        (new Publisher($this->config(), $transport))->publish(['private-room'], 'App\\Events\\Changed', (object) ['empty' => new stdClass], '12.34');
-        $body = json_decode($transport->requests[0]->body, true, flags: JSON_THROW_ON_ERROR);
-        $this->assertSame('12.34', $body['socket_id']);
-        $this->assertSame('{"empty":{}}', $body['data']);
-    }
-
-    #[DataProvider('invalidEvents')]
-    public function test_invalid_events_are_refused_before_transport(array $channels, string $event, mixed $data): void
-    {
-        $transport = $this->transport();
-        try {
-            (new Publisher($this->config(), $transport))->publish($channels, $event, $data);
-            $this->fail('Invalid event reached the transport.');
-        } catch (LiveFailure) {
-            $this->assertSame([], $transport->requests);
-        }
-    }
-
-    public static function invalidEvents(): array
-    {
-        return [
-            'empty channels' => [[], 'changed', []],
-            'duplicate channels' => [['room', 'room'], 'changed', []],
-            'invalid channel' => [['room/path'], 'changed', []],
-            'channel too long' => [[str_repeat('a', 165)], 'changed', []],
-            'too many channels' => [array_map(static fn (int $id): string => 'room-'.$id, range(1, 101)), 'changed', []],
-            'internal event' => [['room'], 'pusher:subscribe', []],
-            'internal subscription ack' => [['room'], 'pusher_internal:subscription_succeeded', []],
-            'event newline' => [['room'], "event\nheader", []],
-            'UTF8 byte bound' => [['room'], 'changed', str_repeat('界', 3400)],
-            'nonfinite payload' => [['room'], 'changed', ['value' => INF]],
-        ];
-    }
-
-    public function test_transport_failure_is_not_retried_and_does_not_leak_response_or_credentials(): void
-    {
-        $transport = $this->transport(403);
-        try {
-            (new Publisher($this->config(), $transport))->publish(['room'], 'changed', []);
-            $this->fail('A failed publish succeeded.');
-        } catch (LiveFailure $error) {
-            $this->assertSame('publish_http_error', $error->reason);
-            $this->assertSame(403, $error->httpStatus);
-            $this->assertStringNotContainsString('7ad3773142a6692b25b8', $error->getMessage());
-            $this->assertCount(1, $transport->requests);
-        }
-    }
-
-    #[DataProvider('invalidEndpoints')]
-    public function test_endpoint_cannot_smuggle_credentials_query_or_path(string $endpoint): void
-    {
-        $this->expectException(LiveFailure::class);
-        new Config($endpoint, '3', 'public-key', 'public-fixture-secret');
-    }
-
-    public static function invalidEndpoints(): array
-    {
-        return array_map(static fn (string $url): array => [$url], ['file:///tmp/a', 'https://user:pass@example.test', 'https://example.test?secret=a', 'https://example.test#token', 'https://example.test/not-api-root']);
-    }
-
-    public function test_authorization_is_scoped_to_protected_channels_and_valid_socket_ids(): void
-    {
-        $auth = new Authorization($this->config());
-        foreach ([['1234.1234', 'room'], ['invalid', 'private-room'], ['1234.1234', 'private-encrypted-room']] as [$socket, $channel]) {
-            try {
-                $auth->privateChannel($socket, $channel);
-                $this->fail('Invalid authorization scope was signed.');
-            } catch (LiveFailure) {
-                $this->addToAssertionCount(1);
-            }
-        }
-    }
+    return new Config('https://socket.example', '3', '278d425bdf160c739803', '7ad3773142a6692b25b8');
 }
+
+function livePublisherTransport(int $status = 200): Transport
+{
+    return new class($status) implements Transport
+    {
+        public array $requests = [];
+
+        public function __construct(private int $status) {}
+
+        public function send(SignedRequest $request): HttpResponse
+        {
+            $this->requests[] = $request;
+
+            return new HttpResponse($this->status);
+        }
+    };
+}
+
+test('http signature matches the official pusher vector', function (): void {
+    $transport = livePublisherTransport();
+    $publisher = new Publisher(livePublisherConfig(), $transport, static fn (): int => 1353088179);
+    $publisher->publish(['project-3'], 'foo', ['some' => 'data']);
+    $request = $transport->requests[0];
+    $this->assertSame('{"name":"foo","channels":["project-3"],"data":"{\\"some\\":\\"data\\"}"}', $request->body);
+    parse_str(parse_url($request->url, PHP_URL_QUERY), $query);
+    $this->assertSame('ec365a775a4cd0599faeb73354201b6f', $query['body_md5']);
+    $this->assertSame('da454824c97ba181a32ccc17a72625ba02771f50b50e1e7430e47a1f3f457e6c', $query['auth_signature']);
+    $this->assertSame('1353088179', $query['auth_timestamp']);
+});
+
+test('private authorization matches the official vector', function (): void {
+    $auth = new Authorization(livePublisherConfig());
+    $this->assertSame(['auth' => '278d425bdf160c739803:58df8b0c36d6982b82c3ecf6b4662e34fe8c25bba48f5369f135bf843651c3a4'],
+        $auth->privateChannel('1234.1234', 'private-foobar'));
+});
+
+test('presence authorization signs the exact returned data', function (): void {
+    $auth = new Authorization(livePublisherConfig());
+    $result = $auth->presenceChannel('1234.1234', 'presence-foobar', 10, ['name' => 'Mr. Channels']);
+    $this->assertSame('{"user_id":10,"user_info":{"name":"Mr. Channels"}}', $result['channel_data']);
+    // Independently checked with Python hmac/hashlib. The documentation's
+    // displayed presence digest does not reproduce for its stated bytes.
+    $this->assertSame('278d425bdf160c739803:31935e7d86dba64c2a90aed31fdc61869f9b22ba9d8863bba239c03ca481bc80', $result['auth']);
+});
+
+test('publishing preserves json objects and excludes the sender', function (): void {
+    $transport = livePublisherTransport();
+    (new Publisher(livePublisherConfig(), $transport))->publish(['private-room'], 'App\\Events\\Changed', (object) ['empty' => new stdClass], '12.34');
+    $body = json_decode($transport->requests[0]->body, true, flags: JSON_THROW_ON_ERROR);
+    $this->assertSame('12.34', $body['socket_id']);
+    $this->assertSame('{"empty":{}}', $body['data']);
+});
+
+test('invalid events are refused before transport', function (array $channels, string $event, mixed $data): void {
+    $transport = livePublisherTransport();
+    try {
+        (new Publisher(livePublisherConfig(), $transport))->publish($channels, $event, $data);
+        $this->fail('Invalid event reached the transport.');
+    } catch (LiveFailure) {
+        $this->assertSame([], $transport->requests);
+    }
+})->with(livePublisherInvalidEvents());
+
+function livePublisherInvalidEvents(): array
+{
+    return [
+        'empty channels' => [[], 'changed', []],
+        'duplicate channels' => [['room', 'room'], 'changed', []],
+        'invalid channel' => [['room/path'], 'changed', []],
+        'channel too long' => [[str_repeat('a', 165)], 'changed', []],
+        'too many channels' => [array_map(static fn (int $id): string => 'room-'.$id, range(1, 101)), 'changed', []],
+        'internal event' => [['room'], 'pusher:subscribe', []],
+        'internal subscription ack' => [['room'], 'pusher_internal:subscription_succeeded', []],
+        'event newline' => [['room'], "event\nheader", []],
+        'UTF8 byte bound' => [['room'], 'changed', str_repeat('界', 3400)],
+        'nonfinite payload' => [['room'], 'changed', ['value' => INF]],
+    ];
+}
+
+test('transport failure is not retried and does not leak response or credentials', function (): void {
+    $transport = livePublisherTransport(403);
+    try {
+        (new Publisher(livePublisherConfig(), $transport))->publish(['room'], 'changed', []);
+        $this->fail('A failed publish succeeded.');
+    } catch (LiveFailure $error) {
+        $this->assertSame('publish_http_error', $error->reason);
+        $this->assertSame(403, $error->httpStatus);
+        $this->assertStringNotContainsString('7ad3773142a6692b25b8', $error->getMessage());
+        $this->assertCount(1, $transport->requests);
+    }
+});
+
+test('endpoint cannot smuggle credentials query or path', function (string $endpoint): void {
+    $this->expectException(LiveFailure::class);
+    new Config($endpoint, '3', 'public-key', 'public-fixture-secret');
+})->with(livePublisherInvalidEndpoints());
+
+function livePublisherInvalidEndpoints(): array
+{
+    return array_map(static fn (string $url): array => [$url], ['file:///tmp/a', 'https://user:pass@example.test', 'https://example.test?secret=a', 'https://example.test#token', 'https://example.test/not-api-root']);
+}
+
+test('authorization is scoped to protected channels and valid socket ids', function (): void {
+    $auth = new Authorization(livePublisherConfig());
+    foreach ([['1234.1234', 'room'], ['invalid', 'private-room'], ['1234.1234', 'private-encrypted-room']] as [$socket, $channel]) {
+        try {
+            $auth->privateChannel($socket, $channel);
+            $this->fail('Invalid authorization scope was signed.');
+        } catch (LiveFailure) {
+            $this->addToAssertionCount(1);
+        }
+    }
+});
