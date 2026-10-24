@@ -58,3 +58,16 @@ jobs:
 
       - name: Core without Composer or framework autoloading
         run: php tests/core-smoke.php
+
+  # This repo's main-protection ruleset requires the literal "build" check.
+  # Keep the matrix labels and require every test/allowlist/smoke step above.
+  build:
+    name: build
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all PHP checks
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: test "$TEST_RESULT" = success
